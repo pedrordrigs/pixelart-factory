@@ -334,22 +334,6 @@ class SmartCleaner:
             
         arr = np.array(img)
         
-        # New image size (logical pixels)
-        # Note: The output of smart cleaner is often the "small" image (logical resolution)
-        # But to be compatible with the pipeline, we might want to return it upscaled?
-        # The Rust tool outputs the small logical image (e.g., 64x64).
-        # But my pipeline expects `target_grid` size output usually.
-        # I will generate the small one, and let the caller upscale if needed, 
-        # OR I can return the small one and let the UI handle it.
-        # To maintain API compatibility with `pixel_art_cleaner`, I should probably upscale it back 
-        # if the user requested a specific size. 
-        # BUT, `pixel_art_cleaner` takes `target_grid`. 
-        # SmartCleaner figures out the grid itself. 
-        # Let's return the logical image (small) and let the UI upscale it if desired.
-        
-        # Actually, let's upscale it back to the original size or nearest large size using Nearest Neighbor
-        # to match the "Cleaned" look.
-        
         out_arr = np.zeros((rows, cols, 4), dtype=np.uint8)
         
         for r in range(rows):
@@ -370,17 +354,13 @@ class SmartCleaner:
                 
                 # Count frequencies
                 # Numpy unique is a bit slow for this loop, but it's pure python port.
-                # Optimization: just take the center pixel if too slow? 
-                # No, mode is better.
                 
                 # Use a simple heuristic: random sampling or center if large, else full mode
                 if len(pixels) > 100:
                     # Sample center 50%
                     center_y = (y_end - y_start) // 2
                     center_x = (x_end - x_start) // 2
-                    # Just take center for speed in Python?
                     # The Rust one does full histogram.
-                    # Let's try full unique, it shouldn't be too slow for typical pixel art sizes (256x256 -> 64x64)
                     pass
                 
                 # Fast mode finding
