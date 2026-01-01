@@ -18,7 +18,7 @@ POSITIVE_PROMPT_TEMPLATE = """{subject}, {res_string} resolution, authentic pixe
 NEGATIVE_PROMPT_TEMPLATE = """anti-aliasing, blur, fuzzy, noise, realistic, 3d render, vector, gradients, soft edges, compression artifacts, messy lines, photography, shadow on background, distorted, stretched, blurry, low resolution, interpolation, dithering, bloom, glow, semi-transparent pixels"""
 
 # Spritesheet-specific prompt additions - Enhanced for frame consistency and game-ready alignment
-SPRITESHEET_ADDITIONS = """, master spritesheet, animation atlas, sequential action frames, perfect tiled layout, uniform frame dimensions, consistent character anatomy, frame-by-frame sequence, identical lighting across all tiles, centered on grid, neutral pose, game-ready animation strip"""
+SPRITESHEET_ADDITIONS = """, master spritesheet, animation atlas, sequential action frames, perfect tiled layout, uniform frame dimensions, consistent character design, frame-by-frame animation, identical style across all tiles, centered on grid, neutral pose, game-ready animation strip"""
 
 
 class PixelArtGenerator:
@@ -179,6 +179,66 @@ class PixelArtGenerator:
         except Exception as e:
             print(f"Reference generation failed with model {model}: {e}")
             raise e
+
+    def generate_next_frame(
+        self,
+        reference_image: Image.Image,
+        action: str,
+        frame_idx: int,
+        total_frames: int,
+        size: Optional[Tuple[int, int]] = None,
+        custom_positive: Optional[str] = None,
+        custom_negative: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ) -> Image.Image:
+        """
+        Generate the next sequential frame based on a reference image.
+        """
+        # Specific prompt for sequential generation
+        prompt_core = (
+            f"Generate the exact next sequential animation frame for action: '{action}'. "
+            f"This is frame {frame_idx + 1} of a {total_frames}-frame loop. "
+            f"Continue the movement logically from the provided reference image. "
+            f"Maintain exact character consistency, scale, colors, and pixel style. "
+            f"The image must be a single isolated sprite on a white background, not a spritesheet."
+        )
+        
+        full_prompt = self._build_prompt(
+            subject=prompt_core,
+            size=size,
+            custom_positive=custom_positive,
+            custom_negative=custom_negative,
+            is_spritesheet=False # We want a single frame
+        )
+        
+        model = model_name or self.model_name
+        print(f"Generating sequential frame {frame_idx + 1}/{total_frames} for '{action}' using {model}...")
+        
+        img_buffer = io.BytesIO()
+        reference_image.save(img_buffer, format="PNG")
+        img_bytes = img_buffer.getvalue()
+        
+        image_part = types.Part.from_bytes(
+            data=img_bytes,
+            mime_type="image/png"
+        )
+        
+        try:
+            config = types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"],
+            )
+            
+            response = self.client.models.generate_content(
+                model=model,
+                contents=[image_part, full_prompt],
+                config=config
+            )
+            
+            return self._process_image_response(response, target_size=size)
+            
+        except Exception as e:
+            print(f"Sequential generation failed with model {model}: {e}")
+            raise e
     
     def generate_spritesheet_prompt(
         self,
@@ -203,7 +263,7 @@ class PixelArtGenerator:
             f"High-quality game spritesheet of {subject} {action} animation. "
             f"{res_string}"
             f"A single horizontal row containing exactly {frames} separate animation frames. "
-            f"Flat tiled view, animation atlas, consistent scale, fixed perspective, and character design across all {frames} frames. "
+            f"Flat tiled view, atlas textures, consistent scale, fixed perspective, and character design across all {frames} frames. "
             f"No distortion, no stretching, perfect alignment. "
             f"Pixel art style, game asset, high-contrast indexed colors, limited color palette, sharp crisp pixels, flat shading, "
             f"clean thick outlines, side view, 16-bit aesthetic, "

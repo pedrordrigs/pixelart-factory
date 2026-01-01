@@ -3,6 +3,8 @@ Spritesheet Generator - Create and process spritesheets.
 """
 
 import os
+import io
+import zipfile
 from typing import List, Optional, Tuple, Union
 from PIL import Image
 
@@ -137,6 +139,71 @@ class SpritesheetGenerator:
             return cleaned
         
         return raw_sheet
+
+    def generate_sequential_spritesheet(
+        self,
+        reference_path: Union[str, Image.Image],
+        action: str = "walk",
+        frames: int = 4,
+        frame_size: int = 64,
+        clean: bool = False,
+        custom_positive: Optional[str] = None,
+        custom_negative: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ) -> Tuple[Image.Image, bytes]:
+        """
+        Generate a spritesheet by creating frames sequentially.
+        
+        Returns:
+            Tuple of (combined_spritesheet_image, zip_file_bytes)
+        """
+        if isinstance(reference_path, str):
+            current_frame = Image.open(reference_path)
+        else:
+            current_frame = reference_path
+        
+        # Ensure frame 1 is sized correctly to start (optional, but good for consistency)
+        if current_frame.size != (frame_size, frame_size):
+            current_frame = current_frame.resize((frame_size, frame_size), Image.Resampling.LANCZOS)
+            
+        generated_frames = [current_frame]
+        
+        # Generate subsequent frames
+        # We use the *original* frame as the style anchor for every 2nd generation to prevent drift?
+        # Or chain them? Chaining usually creates better motion but drift.
+        # Let's try chaining for motion.
+        
+        for i in range(1, frames):
+            print(f"Generating sequential frame {i+1}...")
+            next_frame = self.generator.generate_next_frame(
+                reference_image=generated_frames[-1], # Use previous frame as reference
+                action=action,
+                frame_idx=i,
+                total_frames=frames,
+                size=(frame_size, frame_size),
+                custom_positive=custom_positive,
+                custom_negative=custom_negative,
+                model_name=model_name
+            )
+            generated_frames.append(next_frame)
+            
+        # Combine into sheet
+        sheet = self.create_spritesheet_from_frames(generated_frames, cols=frames, padding=0)
+        
+        # Create ZIP
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, frame in enumerate(generated_frames):
+                img_byte_arr = io.BytesIO()
+                frame.save(img_byte_arr, format='PNG')
+                zf.writestr(f"frame_{i+1:02d}.png", img_byte_arr.getvalue())
+            
+            # Also save the full sheet
+            sheet_byte_arr = io.BytesIO()
+            sheet.save(sheet_byte_arr, format='PNG')
+            zf.writestr("full_spritesheet.png", sheet_byte_arr.getvalue())
+            
+        return sheet, zip_buffer.getvalue()
     
     def extract_frames(
         self,

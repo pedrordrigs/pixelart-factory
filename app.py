@@ -19,7 +19,7 @@ from src.spritesheet import SpritesheetGenerator
 # --- Sidebar ---
 st.sidebar.title("👾 PixelArt Factory")
 
-mode = st.sidebar.radio("Mode", ["Generate", "Clean Image", "Spritesheet"])
+mode = st.sidebar.radio("Mode", ["Generate", "Clean Image", "Spritesheet", "Sequential Spritesheet"])
 
 api_key = st.sidebar.text_input("Google API Key", type="password", value=os.environ.get("GOOGLE_API_KEY", ""))
 if api_key:
@@ -248,6 +248,80 @@ elif mode == "Spritesheet":
             buf = io.BytesIO()
             cleaned_sheet.save(buf, format="PNG")
             st.download_button("Download Sheet", buf.getvalue(), "spritesheet.png", "image/png")
+
+elif mode == "Sequential Spritesheet":
+    st.title("Sequential Spritesheet Generation")
+    st.markdown("Generate animation frames one-by-one from a starting image.")
+    
+    # 1. Input Image (Required)
+    st.markdown("### 1. Input Frame")
+    seq_input_file = st.file_uploader("Upload Starting Frame", type=["png", "jpg", "jpeg"], key="seq_input")
+    
+    if seq_input_file:
+        st.image(seq_input_file, width=128, caption="Frame 1 (Start)")
+    
+    # 2. Settings
+    st.markdown("### 2. Animation Settings")
+    seq_action = st.text_input("Action Name", "walking cycle", key="seq_action", help="Describe the movement.")
+    
+    c1, c2 = st.columns(2)
+    seq_frames = c1.number_input("Total Frames", 2, 16, 4, key="seq_frames", help="Total frames including the first one.")
+    seq_res = c2.select_slider("Frame Resolution", [32, 64, 128, 256, 512], value=64, key="seq_res")
+    
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        custom_positive = st.text_input("Extra Style Tags", "consistent character", key="seq_pos")
+    with col_s2:
+        custom_negative = st.text_input("Negative Prompts", "morphing, style change", key="seq_neg")
+    
+    # 3. Generate
+    if st.button("Generate Sequence"):
+        if not api_key:
+            st.error("API Key required")
+        elif not seq_input_file:
+            st.error("Please upload a starting frame first.")
+        else:
+            with st.spinner(f"Generating {seq_frames} frames sequentially... This may take a moment."):
+                try:
+                    sheet_gen = SpritesheetGenerator(api_key=api_key)
+                    start_img = Image.open(seq_input_file)
+                    
+                    # Call sequential generation
+                    sheet, zip_bytes = sheet_gen.generate_sequential_spritesheet(
+                        reference_path=start_img,
+                        action=seq_action,
+                        frames=seq_frames,
+                        frame_size=seq_res,
+                        custom_positive=custom_positive,
+                        custom_negative=custom_negative,
+                        model_name=model_name
+                    )
+                    
+                    st.session_state['seq_sheet_image'] = sheet
+                    st.session_state['seq_zip_data'] = zip_bytes
+                    
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    # 4. Results
+    if 'seq_sheet_image' in st.session_state:
+        sheet = st.session_state['seq_sheet_image']
+        zip_data = st.session_state['seq_zip_data']
+        
+        # Clean reactive
+        cleaned_sheet = clean_image_reactive(sheet, smart_k, upscale_factor)
+        
+        st.subheader("Sequential Result")
+        st.image(cleaned_sheet, use_container_width=True, caption="Combined Sequence")
+        
+        c_d1, c_d2 = st.columns(2)
+        with c_d1:
+            buf = io.BytesIO()
+            cleaned_sheet.save(buf, format="PNG")
+            st.download_button("Download Sheet (PNG)", buf.getvalue(), "seq_spritesheet.png", "image/png")
+            
+        with c_d2:
+            st.download_button("Download All Frames (ZIP)", zip_data, "frames.zip", "application/zip")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("Made with ❤️ using PixelArt Factory")
