@@ -13,7 +13,7 @@ from google.genai import types
 
 
 # Optimized prompt templates for pixel art generation - Refined based on game dev best practices
-POSITIVE_PROMPT_TEMPLATE = """{subject}, {res_string} resolution, authentic pixel art style, game asset, high-contrast indexed colors, limited color palette, sharp crisp pixels, flat shading, clean thick outlines, orthographic side view, professional sprite design, retro 16-bit aesthetic, isolated on solid white background, no gradients, no blur, aliasing-free"""
+POSITIVE_PROMPT_TEMPLATE = """{subject}, {perspective} view, {res_string} resolution, authentic pixel art style, game asset, high-contrast indexed colors, limited color palette, sharp crisp pixels, flat shading, clean thick outlines, professional sprite design, retro 16-bit aesthetic, isolated on solid white background, no gradients, no blur, aliasing-free"""
 
 NEGATIVE_PROMPT_TEMPLATE = """anti-aliasing, blur, fuzzy, noise, realistic, 3d render, vector, gradients, soft edges, compression artifacts, messy lines, photography, shadow on background, distorted, stretched, blurry, low resolution, interpolation, dithering, bloom, glow, semi-transparent pixels"""
 
@@ -44,9 +44,11 @@ class PixelArtGenerator:
         self,
         subject: str,
         size: Optional[Tuple[int, int]] = (512, 512),
+        perspective: str = "orthographic side",
         custom_positive: Optional[str] = None,
         custom_negative: Optional[str] = None,
         is_spritesheet: bool = False,
+        logical_resolution: Optional[int] = 64,
     ) -> str:
         """
         Build the full prompt for image generation.
@@ -57,7 +59,16 @@ class PixelArtGenerator:
         else:
             res_string = "high"
             
-        positive = POSITIVE_PROMPT_TEMPLATE.format(subject=subject, res_string=res_string)
+        # Add logical resolution hint to prompt if provided
+        # This helps the model understand the "chunkiness" of the pixels
+        if logical_resolution:
+            subject = f"{subject}, drawn on a {logical_resolution}x{logical_resolution} pixel grid"
+
+        positive = POSITIVE_PROMPT_TEMPLATE.format(
+            subject=subject, 
+            res_string=res_string,
+            perspective=perspective
+        )
         
         if is_spritesheet:
             positive += SPRITESHEET_ADDITIONS
@@ -96,9 +107,11 @@ class PixelArtGenerator:
         self,
         prompt: str,
         size: Optional[Tuple[int, int]] = (512, 512),
+        perspective: str = "orthographic side",
         custom_positive: Optional[str] = None,
         custom_negative: Optional[str] = None,
         model_name: Optional[str] = None,
+        logical_resolution: Optional[int] = 64,
     ) -> Image.Image:
         """
         Generate a pixel art image from a text prompt.
@@ -106,8 +119,10 @@ class PixelArtGenerator:
         full_prompt = self._build_prompt(
             subject=prompt,
             size=size,
+            perspective=perspective,
             custom_positive=custom_positive,
             custom_negative=custom_negative,
+            logical_resolution=logical_resolution
         )
         
         model = model_name or self.model_name
@@ -142,6 +157,7 @@ class PixelArtGenerator:
         """
         Generate a pixel art image based on a reference image.
         """
+        # For reference generation, we default perspective to 'consistent with reference' roughly
         full_prompt = self._build_prompt(
             subject=prompt,
             size=size,
@@ -321,6 +337,41 @@ class PixelArtGenerator:
             print(f"Spritesheet generation failed with model {model}: {e}")
             raise e
 
+    def enhance_prompt(
+        self,
+        user_input: str,
+        model_name: Optional[str] = None
+    ) -> str:
+        """
+        Enhance a user prompt for pixel art generation using the LLM.
+        """
+        system_instruction = """
+        You are a Prompt Engineer specialized in Pixel Art.
+        Your goal is to rewrite the user's request into a highly descriptive prompt optimized for diffusion models generating pixel art.
+        
+        Guidelines:
+        - Include keywords like 'pixel art', 'orthographic', 'isometric', 'game asset', '16-bit', 'clean lines'.
+        - Describe lighting, colors, and perspective.
+        - Do not add negative constraints (like 'no blur') in the output, those are handled separately.
+        - Keep it concise but descriptive (under 50 words).
+        - Output ONLY the enhanced prompt string.
+        """
+        
+        model = model_name or self.model_name
+        
+        try:
+            response = self.client.models.generate_content(
+                model=model,
+                contents=f"Enhance this pixel art request: {user_input}",
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                )
+            )
+            return response.text.strip()
+        except Exception as e:
+            print(f"Prompt enhancement failed: {e}")
+            return user_input
+
 
 def generate_image(
     prompt: str,
@@ -332,21 +383,3 @@ def generate_image(
     """
     generator = PixelArtGenerator(api_key=api_key)
     return generator.generate(prompt, size=size)
-
-
-def generate_from_file(
-    reference_path: str,
-    prompt: str,
-    output_path: str,
-    api_key: Optional[str] = None,
-    size: Optional[Tuple[int, int]] = (512, 512),
-) -> None:
-    """
-    Generate an image from a reference file and save.
-    """
-    generator = PixelArtGenerator(api_key=api_key)
-    reference = Image.open(reference_path)
-    
-    result = generator.generate_from_reference(reference, prompt, size=size)
-    result.save(output_path)
-    print(f"Generated image saved to: {output_path}")

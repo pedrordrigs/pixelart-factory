@@ -13,6 +13,9 @@ from pathlib import Path
 from src.cleaner import pixel_art_cleaner, PixelArtCleaner
 from src.generator import PixelArtGenerator
 from src.spritesheet import SpritesheetGenerator
+from src.processor import PixelProcessor
+from src.linter import PixelLinter
+from src.agent import PixelArtAgent
 from src.utils import load_image, save_image, validate_grid_size
 
 
@@ -254,6 +257,91 @@ def cmd_combine(args):
     
     print(f"\nDone! Spritesheet saved to: {args.output}")
 
+def cmd_factory(args):
+    """Run the advanced PixelArt Factory pipeline."""
+    print("=" * 50)
+    print("PixelArt Factory - Advanced Pipeline")
+    print("=" * 50)
+
+    # 1. Acquire Image (Generate or Load)
+    if args.prompt:
+        api_key = args.api_key or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            print("Error: API key required for generation.")
+            sys.exit(1)
+        
+        print(f"Generating from prompt: {args.prompt}")
+        generator = PixelArtGenerator(api_key=api_key)
+        # Generate at high res, processor will downscale
+        image = generator.generate(
+            prompt=args.prompt,
+            size=(512, 512), 
+            model_name=args.model_name
+        )
+    elif args.input:
+        print(f"Loading input: {args.input}")
+        if not os.path.exists(args.input):
+            print(f"Error: File not found: {args.input}")
+            sys.exit(1)
+        image = load_image(args.input)
+    else:
+        print("Error: Must provide --prompt or --input")
+        sys.exit(1)
+
+    # 2. Process (Factory Layer)
+    print("Running Processor Layer...")
+    processor = PixelProcessor()
+    
+    target_size = (args.grid_size, args.grid_size)
+    
+    # Optional: Use SmartCleaner first for grid alignment
+    # If using factory directly, we might skip smart cleaner or add it as a flag
+    # For now, let's keep it simple in 'factory' command, mirroring the deterministic pipeline
+    
+    processed_image = processor.process_pipeline(
+        image,
+        target_size=target_size,
+        palette_size=args.palette,
+        exact_scaling=True
+    )
+    
+    # 3. Linter (QA Layer)
+    if args.lint:
+        print("Running Pixel Linter...")
+        linter = PixelLinter()
+        report = linter.lint(processed_image, expected_palette_size=args.palette)
+        
+        print("\n--- QA Report ---")
+        print(f"Palette Check: {'PASS' if report['palette_check']['passed'] else 'FAIL'} ({report['palette_check']['count']} colors)")
+        print(f"Orphan Pixels: {report['orphan_pixels']}")
+        print(f"Grid Consistency: {'PASS' if report['grid_consistency']['consistent'] else 'WARN'}")
+        print("-----------------\n")
+        
+        if report['orphan_pixels'] > 0:
+            print(f"Fixing {report['orphan_pixels']} orphan pixels...")
+            processed_image = linter.remove_orphans(processed_image)
+
+    save_image(processed_image, args.output)
+    print(f"Done! Factory output saved to: {args.output}")
+
+def cmd_agent(args):
+    """Run the Autonomous PixelArt Agent."""
+    print("=" * 50)
+    print("PixelArt Agent - Autonomous Creation")
+    print("=" * 50)
+    
+    agent = PixelArtAgent(
+        api_key=args.api_key,
+        model_name=args.model_name
+    )
+    
+    agent.create_asset(
+        user_request=args.prompt,
+        output_path=args.output,
+        iterations=1
+    )
+    print(f"\nAgent Mission Complete. Output: {args.output}")
+
 
 def main():
     """Main entry point."""
@@ -268,14 +356,11 @@ Examples:
   # Clean an existing image
   python main.py clean --input messy.png --output clean.png --palette 16
   
-  # Generate a spritesheet
-  python main.py spritesheet --prompt "slime monster" --action walk --frames 4
+  # Run advanced factory pipeline
+  python main.py factory --prompt "cyberpunk city" --palette 8 --lint
   
-  # Split a spritesheet into frames
-  python main.py split --input sheet.png --frame-size 64 --cols 4 --frames 8
-  
-  # Combine images into a spritesheet
-  python main.py combine ./frames/ --output sheet.png --cols 4
+  # Run autonomous agent
+  python main.py agent --prompt "Create a 16-bit rpg potion bottle" --output potion.png
         """
     )
     
@@ -374,6 +459,30 @@ Examples:
     combine_parser.add_argument("--padding", type=int, default=0,
                                help="Padding between frames (default: 0)")
     combine_parser.set_defaults(func=cmd_combine)
+
+    # ========================
+    # Factory Command
+    # ========================
+    factory_parser = subparsers.add_parser("factory", help="Run the advanced factory pipeline")
+    factory_parser.add_argument("--prompt", "-p", help="Text prompt")
+    factory_parser.add_argument("--input", "-i", help="Input image")
+    factory_parser.add_argument("--output", "-o", default="factory_output.png")
+    factory_parser.add_argument("--grid-size", "-g", type=int, default=64, help="Target logical size (e.g. 64)")
+    factory_parser.add_argument("--palette", "-c", type=int, default=16, help="Color palette size")
+    factory_parser.add_argument("--lint", action="store_true", help="Run QA linter")
+    factory_parser.add_argument("--api-key", help="Google AI API key")
+    factory_parser.add_argument("--model-name", help="Model name")
+    factory_parser.set_defaults(func=cmd_factory)
+
+    # ========================
+    # Agent Command
+    # ========================
+    agent_parser = subparsers.add_parser("agent", help="Run the Autonomous PixelArt Agent")
+    agent_parser.add_argument("--prompt", "-p", required=True, help="Description of what to create")
+    agent_parser.add_argument("--output", "-o", default="agent_output.png")
+    agent_parser.add_argument("--api-key", help="Google AI API key")
+    agent_parser.add_argument("--model-name", default="gemini-2.0-flash-exp", help="Model name")
+    agent_parser.set_defaults(func=cmd_agent)
     
     # Parse and execute
     args = parser.parse_args()

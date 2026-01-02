@@ -6,13 +6,14 @@ Implements grid detection and dominant-color resampling.
 
 import numpy as np
 from PIL import Image
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
 
 @dataclass
 class SmartConfig:
     k_colors: int = 16
+    k_seed: int = 42
     max_kmeans_iterations: int = 15
     peak_threshold_multiplier: float = 0.2
     peak_distance_filter: int = 4
@@ -21,48 +22,53 @@ class SmartConfig:
     walker_strength_threshold: float = 0.5
     min_cuts_per_axis: int = 4
     fallback_target_segments: int = 64
-    max_step_ratio: float = 1.8
-
+    max_step_ratio: float = 1.8 # Lowered from 3.0 to catch more skew cases
 
 class SmartCleaner:
-    def __init__(self, config: SmartConfig = SmartConfig()):
-        self.config = config
+    def __init__(self, config: SmartConfig = None):
+        self.config = config if config else SmartConfig()
 
     def process(self, image: Image.Image) -> Image.Image:
-        """Main processing pipeline."""
-        # 1. Quantize colors first (like in Rust implementation)
-        # Convert to RGBA
+        """Main processing pipeline matching Rust implementation."""
+        # 1. Load and Validate
         img = image.convert("RGBA")
         width, height = img.size
         
-        # Quantize
-        quantized = self.quantize_image(img)
+        if width == 0 or height == 0:
+             raise ValueError("Image dimensions cannot be zero")
+        if width > 10000 or height > 10000:
+             raise ValueError("Image dimensions too large")
+
+        # 2. Quantize
+        quantized_img = self.quantize_image(img)
         
-        # 2. Compute profiles (gradients)
-        profile_x, profile_y = self.compute_profiles(quantized)
+        # 3. Compute Profiles
+        profile_x, profile_y = self.compute_profiles(quantized_img)
         
-        # 3. Estimate step sizes
+        # 4. Estimate step sizes
         step_x_opt = self.estimate_step_size(profile_x)
         step_y_opt = self.estimate_step_size(profile_y)
         
-        # 4. Resolve step sizes
+        # 5. Resolve step sizes
         step_x, step_y = self.resolve_step_sizes(step_x_opt, step_y_opt, width, height)
         
-        # 5. Walk profiles to find cuts
+        # 6. Walk profiles to find raw cuts
         raw_col_cuts = self.walk(profile_x, step_x, width)
         raw_row_cuts = self.walk(profile_y, step_y, height)
         
-        # 6. Stabilize cuts (Simplified version of Rust's stabilize_both_axes)
-        col_cuts = self.stabilize_cuts(profile_x, raw_col_cuts, width, raw_row_cuts, height)
-        row_cuts = self.stabilize_cuts(profile_y, raw_row_cuts, height, raw_col_cuts, width)
+        # 7. Two-pass stabilization
+        col_cuts, row_cuts = self.stabilize_both_axes(
+            profile_x, profile_y,
+            raw_col_cuts, raw_row_cuts,
+            width, height
+        )
         
-        # 7. Resample
-        result = self.resample(quantized, col_cuts, row_cuts)
+        # 8. Resample
+        output_img = self.resample(quantized_img, col_cuts, row_cuts)
         
-        return result
+        return output_img
 
     def quantize_image(self, img: Image.Image) -> Image.Image:
-        """Reduce colors using K-Means."""
         if self.config.k_colors == 0:
             return img
 
@@ -70,83 +76,84 @@ class SmartCleaner:
         arr = np.array(img)
         h, w, d = arr.shape
         
-        # Filter out transparent pixels for training
+        # Reshape to pixels
         pixels = arr.reshape(-1, 4)
+        
+        # Filter opaque pixels (alpha > 0)
+        # Rust: p[3] == 0 check
         opaque_mask = pixels[:, 3] > 0
         opaque_pixels = pixels[opaque_mask][:, :3] # RGB only
         
-        if len(opaque_pixels) == 0:
+        n_pixels = len(opaque_pixels)
+        if n_pixels == 0:
             return img
             
-        unique_colors = len(np.unique(opaque_pixels, axis=0))
-        k = min(self.config.k_colors, unique_colors)
-        
-        if k < 2:
-            return img
-
-        print(f"Smart Quantizing to {k} colors...")
-        
-        # Use MiniBatchKMeans for speed if image is large, else KMeans
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=3, max_iter=self.config.max_kmeans_iterations)
+        k = min(self.config.k_colors, len(np.unique(opaque_pixels, axis=0)))
+        if k < 1: # Should be at least 1 color if n_pixels > 0
+            k = 1
+            
+        # Use MiniBatchKMeans
+        kmeans = MiniBatchKMeans(
+            n_clusters=k,
+            random_state=self.config.k_seed,
+            n_init=3,
+            max_iter=self.config.max_kmeans_iterations,
+            batch_size=256
+        )
         kmeans.fit(opaque_pixels)
         centroids = kmeans.cluster_centers_.astype(np.uint8)
         
-        # Map all pixels to nearest centroid
-        # We need to process transparent pixels too (keep them transparent)
+        # Predict all opaque pixels
+        # Create output array initialized with original
+        new_pixels = pixels.copy()
         
-        # Create a new image array
-        new_arr = np.zeros_like(arr)
+        # Only update RGB of opaque pixels, keep Alpha
+        labels = kmeans.predict(new_pixels[opaque_mask][:, :3])
+        new_pixels[opaque_mask, :3] = centroids[labels]
         
-        # Process opaque pixels
-        labels = kmeans.predict(opaque_pixels)
-        quantized_rgb = centroids[labels]
-        
-        # Reconstruct (this is slow in pure python, but numpy helps)
-        # We need to put pixels back in place. 
-        # Easier way: Predict all, then mask alpha.
-        
-        all_rgb = pixels[:, :3]
-        all_labels = kmeans.predict(all_rgb)
-        all_quantized = centroids[all_labels]
-        
-        final_pixels = np.zeros_like(pixels)
-        final_pixels[:, :3] = all_quantized
-        final_pixels[:, 3] = pixels[:, 3] # Keep original alpha
-        
-        # Mask transparent ones strictly? 
-        # Rust impl keeps alpha as is but changes RGB. 
-        # But for output we usually want full transparency if alpha is 0
-        
-        final_pixels = final_pixels.reshape(h, w, 4)
-        return Image.fromarray(final_pixels.astype(np.uint8))
+        # Reshape back to image
+        new_arr = new_pixels.reshape(h, w, 4)
+        return Image.fromarray(new_arr)
 
     def compute_profiles(self, img: Image.Image) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute gradient profiles along X and Y axes."""
-        # Convert to grayscale for gradient calc
-        gray = np.array(img.convert("L")).astype(float)
-        h, w = gray.shape
+        w, h = img.size
+        if w < 3 or h < 3:
+            raise ValueError("Image too small (minimum 3x3)")
+            
+        # Convert to grayscale weights: 0.299 R + 0.587 G + 0.114 B
+        # Alpha is ignored in Rust impl (if p[3]==0 return 0.0 else gray)
+        # We can simulate this
+        
+        arr = np.array(img).astype(float)
+        # Calculate gray
+        r, g, b, a = arr[:,:,0], arr[:,:,1], arr[:,:,2], arr[:,:,3]
+        gray = 0.299 * r + 0.587 * g + 0.114 * b
+        
+        # Apply alpha mask (0 if transparent)
+        gray[a == 0] = 0.0
         
         col_proj = np.zeros(w)
         row_proj = np.zeros(h)
         
-        # Compute gradients (simple difference)
-        # Rust uses kernel [-1, 0, 1] effectively (right - left)
+        # Kernel [-1, 0, 1] means abs(right - left)
+        # For x in 1..w-1
+        # left = gray(x-1, y), right = gray(x+1, y)
         
-        # Gradient X
-        # diff along axis 1 (columns)
-        grad_x = np.abs(gray[:, 2:] - gray[:, :-2]) # skip borders
-        # Sum down the rows
+        # Vectorized Gradient X
+        # gray is (h, w)
+        # diff between col i+1 and i-1
+        grad_x = np.abs(gray[:, 2:] - gray[:, :-2]) # (h, w-2)
+        # Sum along height (axis 0)
         col_proj[1:-1] = np.sum(grad_x, axis=0)
         
-        # Gradient Y
-        # diff along axis 0 (rows)
-        grad_y = np.abs(gray[2:, :] - gray[:-2, :])
+        # Vectorized Gradient Y
+        grad_y = np.abs(gray[2:, :] - gray[:-2, :]) # (h-2, w)
+        # Sum along width (axis 1)
         row_proj[1:-1] = np.sum(grad_y, axis=1)
         
         return col_proj, row_proj
 
     def estimate_step_size(self, profile: np.ndarray) -> Optional[float]:
-        """Estimate grid step size from profile peaks."""
         if len(profile) == 0:
             return None
             
@@ -156,7 +163,8 @@ class SmartCleaner:
             
         threshold = max_val * self.config.peak_threshold_multiplier
         
-        # Find local peaks
+        # Find peaks
+        # Rust: profile[i] > threshold && profile[i] > prev && profile[i] > next
         peaks = []
         for i in range(1, len(profile) - 1):
             if (profile[i] > threshold and 
@@ -167,7 +175,7 @@ class SmartCleaner:
         if len(peaks) < 2:
             return None
             
-        # Filter peaks by distance
+        # Filter by distance
         clean_peaks = [peaks[0]]
         for p in peaks[1:]:
             if p - clean_peaks[-1] > (self.config.peak_distance_filter - 1):
@@ -176,18 +184,13 @@ class SmartCleaner:
         if len(clean_peaks) < 2:
             return None
             
-        # Compute diffs and median
+        # Compute diffs
         diffs = np.diff(clean_peaks)
         return float(np.median(diffs))
 
     def resolve_step_sizes(
-        self, 
-        sx: Optional[float], 
-        sy: Optional[float], 
-        w: int, 
-        h: int
+        self, sx: Optional[float], sy: Optional[float], w: int, h: int
     ) -> Tuple[float, float]:
-        """Decide final step sizes."""
         if sx is not None and sy is not None:
             ratio = sx / sy if sx > sy else sy / sx
             if ratio > self.config.max_step_ratio:
@@ -201,20 +204,20 @@ class SmartCleaner:
         elif sy is not None:
             return sy, sy
         else:
-            # Fallback
             fallback = max(1.0, min(w, h) / self.config.fallback_target_segments)
             return fallback, fallback
 
     def walk(self, profile: np.ndarray, step_size: float, limit: int) -> List[int]:
-        """Walker algorithm to find cut positions."""
+        if len(profile) == 0:
+             raise ValueError("Cannot walk on empty profile")
+             
         cuts = [0]
         current_pos = 0.0
-        
         search_window = max(
             step_size * self.config.walker_search_window_ratio,
             self.config.walker_min_search_window
         )
-        mean_val = np.mean(profile) if len(profile) > 0 else 0
+        mean_val = np.mean(profile) if len(profile) > 0 else 0.0
         
         while current_pos < limit:
             target = current_pos + step_size
@@ -231,9 +234,10 @@ class SmartCleaner:
                 
             # Find max in window
             window = profile[start_search:end_search]
+            # indices in window are relative to start_search
             if len(window) == 0:
                 best_idx = int(target)
-                best_val = 0
+                best_val = -1.0
             else:
                 rel_idx = np.argmax(window)
                 best_idx = start_search + rel_idx
@@ -246,55 +250,142 @@ class SmartCleaner:
                 cuts.append(int(target))
                 current_pos = target
                 
-        return sorted(list(set(cuts))) # Dedup and sort
+        return sorted(list(set(cuts)))
+
+    def stabilize_both_axes(
+        self,
+        profile_x: np.ndarray, profile_y: np.ndarray,
+        raw_col_cuts: List[int], raw_row_cuts: List[int],
+        width: int, height: int
+    ) -> Tuple[List[int], List[int]]:
+        
+        col_cuts_pass1 = self.stabilize_cuts(
+            profile_x, raw_col_cuts, width, raw_row_cuts, height
+        )
+        row_cuts_pass1 = self.stabilize_cuts(
+            profile_y, raw_row_cuts, height, raw_col_cuts, width
+        )
+        
+        col_cells = max(1, len(col_cuts_pass1) - 1)
+        row_cells = max(1, len(row_cuts_pass1) - 1)
+        
+        col_step = width / col_cells
+        row_step = height / row_cells
+        
+        step_ratio = col_step / row_step if col_step > row_step else row_step / col_step
+        
+        if step_ratio > self.config.max_step_ratio:
+            target_step = min(col_step, row_step)
+            
+            if col_step > target_step * 1.2:
+                final_col_cuts = self.snap_uniform_cuts(
+                    profile_x, width, target_step
+                )
+            else:
+                final_col_cuts = col_cuts_pass1
+                
+            if row_step > target_step * 1.2:
+                final_row_cuts = self.snap_uniform_cuts(
+                    profile_y, height, target_step
+                )
+            else:
+                final_row_cuts = row_cuts_pass1
+                
+            return final_col_cuts, final_row_cuts
+        else:
+            return col_cuts_pass1, row_cuts_pass1
 
     def stabilize_cuts(
-        self, 
-        profile: np.ndarray, 
-        cuts: List[int], 
-        limit: int, 
-        sibling_cuts: List[int], 
+        self,
+        profile: np.ndarray,
+        cuts: List[int],
+        limit: int,
+        sibling_cuts: List[int],
         sibling_limit: int
     ) -> List[int]:
-        """Refine cuts to be more uniform if needed."""
-        # Simplified port: just ensure we have enough cuts and they aren't wildly wrong
-        # If we have too few cuts, force uniform grid based on sibling or fallback
+        if limit == 0: return [0]
         
-        # Sanitize
-        cuts = sorted(list(set([max(0, min(x, limit)) for x in cuts])))
-        if 0 not in cuts: cuts.insert(0, 0)
-        if limit not in cuts: cuts.append(limit)
+        cuts = self.sanitize_cuts(cuts, limit)
+        min_required = max(2, min(self.config.min_cuts_per_axis, limit + 1))
         
-        min_required = self.config.min_cuts_per_axis
-        if len(cuts) >= min_required:
+        axis_cells = len(cuts) - 1
+        sibling_cells = max(0, len(sibling_cuts) - 1)
+        
+        sibling_has_grid = (sibling_limit > 0 and 
+                            sibling_cells >= max(1, min_required - 1))
+                            
+        steps_skewed = False
+        if sibling_has_grid and axis_cells > 0:
+            axis_step = limit / axis_cells
+            sibling_step = sibling_limit / sibling_cells
+            step_ratio = axis_step / sibling_step
+            if step_ratio > self.config.max_step_ratio or step_ratio < (1.0 / self.config.max_step_ratio):
+                steps_skewed = True
+                
+        has_enough = len(cuts) >= min_required
+        
+        if has_enough and not steps_skewed:
             return cuts
             
-        # Fallback to uniform
-        cells = max(1, len(sibling_cuts) - 1)
-        if sibling_limit > 0 and cells > 0:
-            target_step = sibling_limit / cells
-        else:
+        # Fallback target step
+        if sibling_has_grid:
+            target_step = sibling_limit / sibling_cells
+        elif self.config.fallback_target_segments > 1:
             target_step = limit / self.config.fallback_target_segments
+        elif axis_cells > 0:
+            target_step = limit / axis_cells
+        else:
+            target_step = float(limit)
             
+        if target_step <= 0: target_step = 1.0
+        
         return self.snap_uniform_cuts(profile, limit, target_step)
 
+    def sanitize_cuts(self, cuts: List[int], limit: int) -> List[int]:
+        if limit == 0: return [0]
+        
+        # Filter and clamp
+        new_cuts = []
+        has_zero = False
+        has_limit = False
+        
+        for val in cuts:
+            if val == 0: has_zero = True
+            if val >= limit:
+                val = limit
+                has_limit = True
+            new_cuts.append(val)
+            
+        if not has_zero: new_cuts.append(0)
+        if not has_limit: new_cuts.append(limit)
+        
+        return sorted(list(set(new_cuts)))
+
     def snap_uniform_cuts(self, profile: np.ndarray, limit: int, target_step: float) -> List[int]:
-        """Create uniform-ish cuts snapping to local peaks."""
-        if target_step <= 0: return [0, limit]
+        if limit == 0: return [0]
+        if limit == 1: return [0, 1]
         
-        desired_cells = max(1, int(round(limit / target_step)))
+        if target_step > 0:
+            desired_cells = int(round(limit / target_step))
+        else:
+            desired_cells = 0
+            
+        min_required = max(2, min(self.config.min_cuts_per_axis, limit + 1))
+        desired_cells = max(max(1, min_required - 1), desired_cells)
+        desired_cells = min(desired_cells, limit)
+        
         cell_width = limit / desired_cells
-        
         search_window = max(
             cell_width * self.config.walker_search_window_ratio,
             self.config.walker_min_search_window
         )
-        mean_val = np.mean(profile) if len(profile) > 0 else 0
+        mean_val = np.mean(profile) if len(profile) > 0 else 0.0
         
         cuts = [0]
         for idx in range(1, desired_cells):
             target = cell_width * idx
             prev = cuts[-1]
+            if prev + 1 >= limit: break
             
             start = int(max(target - search_window, prev + 1))
             end = int(min(target + search_window, limit - 1))
@@ -302,18 +393,21 @@ class SmartCleaner:
             if end < start:
                 best_idx = int(target)
             else:
-                # Find best peak
                 window = profile[start:end+1]
                 if len(window) > 0:
-                    best_idx = start + np.argmax(window)
-                    best_val = window[np.argmax(window)]
+                    rel_idx = np.argmax(window)
+                    best_idx = start + rel_idx
+                    best_val = window[rel_idx]
                     
                     if best_val < mean_val * self.config.walker_strength_threshold:
-                         best_idx = int(target)
+                         # Fallback
+                         fallback = int(round(target))
+                         fallback = max(prev + 1, fallback)
+                         fallback = min(limit - 1, fallback)
+                         best_idx = fallback
                 else:
                     best_idx = int(target)
-            
-            # Ensure strictly increasing
+                    
             if best_idx <= prev:
                 best_idx = prev + 1
             if best_idx >= limit:
@@ -322,10 +416,9 @@ class SmartCleaner:
             cuts.append(best_idx)
             
         cuts.append(limit)
-        return sorted(list(set(cuts)))
+        return self.sanitize_cuts(cuts, limit)
 
     def resample(self, img: Image.Image, col_cuts: List[int], row_cuts: List[int]) -> Image.Image:
-        """Resample image cells to single pixels using mode color."""
         cols = len(col_cuts) - 1
         rows = len(row_cuts) - 1
         
@@ -333,23 +426,7 @@ class SmartCleaner:
             return img
             
         arr = np.array(img)
-        
-        # New image size (logical pixels)
-        # Note: The output of smart cleaner is often the "small" image (logical resolution)
-        # But to be compatible with the pipeline, we might want to return it upscaled?
-        # The Rust tool outputs the small logical image (e.g., 64x64).
-        # But my pipeline expects `target_grid` size output usually.
-        # I will generate the small one, and let the caller upscale if needed, 
-        # OR I can return the small one and let the UI handle it.
-        # To maintain API compatibility with `pixel_art_cleaner`, I should probably upscale it back 
-        # if the user requested a specific size. 
-        # BUT, `pixel_art_cleaner` takes `target_grid`. 
-        # SmartCleaner figures out the grid itself. 
-        # Let's return the logical image (small) and let the UI upscale it if desired.
-        
-        # Actually, let's upscale it back to the original size or nearest large size using Nearest Neighbor
-        # to match the "Cleaned" look.
-        
+        # Output array (rows, cols, 4)
         out_arr = np.zeros((rows, cols, 4), dtype=np.uint8)
         
         for r in range(rows):
@@ -364,36 +441,23 @@ class SmartCleaner:
                 
                 # Extract cell
                 cell = arr[y_start:y_end, x_start:x_end]
-                
-                # Reshape to list of pixels
                 pixels = cell.reshape(-1, 4)
                 
-                # Count frequencies
-                # Numpy unique is a bit slow for this loop, but it's pure python port.
-                # Optimization: just take the center pixel if too slow? 
-                # No, mode is better.
-                
-                # Use a simple heuristic: random sampling or center if large, else full mode
-                if len(pixels) > 100:
-                    # Sample center 50%
-                    center_y = (y_end - y_start) // 2
-                    center_x = (x_end - x_start) // 2
-                    # Just take center for speed in Python?
-                    # The Rust one does full histogram.
-                    # Let's try full unique, it shouldn't be too slow for typical pixel art sizes (256x256 -> 64x64)
-                    pass
-                
-                # Fast mode finding
-                # lexsort to sort rows, then find unique
-                # or turn into void view
-                
-                # Simplest robust way:
+                # Find mode color
+                # Optimization: for very small cells (1x1), just take pixel
+                if len(pixels) == 1:
+                    out_arr[r, c] = pixels[0]
+                    continue
+                    
+                # For larger cells, find most frequent
+                # We can use np.unique, but it returns sorted unique elements
                 vals, counts = np.unique(pixels, axis=0, return_counts=True)
-                mode_idx = np.argmax(counts)
-                mode_pixel = vals[mode_idx]
                 
-                out_arr[r, c] = mode_pixel
-                
+                # We need to sort by count descending
+                # Rust sorts by count desc, then pixel value asc (for stability)
+                # We can just take argmax count
+                if len(counts) > 0:
+                    mode_idx = np.argmax(counts)
+                    out_arr[r, c] = vals[mode_idx]
+                    
         return Image.fromarray(out_arr)
-
-
