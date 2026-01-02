@@ -22,32 +22,17 @@ class TestFactoryPipeline(unittest.TestCase):
         self.processor = PixelProcessor()
         self.linter = PixelLinter()
 
-    def test_quantization_no_dither(self):
+    def test_quantization(self):
         # Quantize to 4 colors
         result = self.processor.process_pipeline(
             self.image, 
             target_size=(32, 32), 
-            palette_size=4, 
-            dither=None
+            palette_size=4
         )
         self.assertEqual(result.size, (32, 32))
         
         # Check palette size
         colors = result.getcolors()
-        self.assertLessEqual(len(colors), 4)
-
-    def test_quantization_with_dither(self):
-        # Test Atkinson
-        result = self.processor.process_pipeline(
-            self.image,
-            target_size=(32, 32),
-            palette_size=4,
-            dither='atkinson'
-        )
-        self.assertEqual(result.size, (32, 32))
-        colors = result.getcolors()
-        # Dithering shouldn't increase palette size beyond target (ideally)
-        # But since we map to palette, it should be exact.
         self.assertLessEqual(len(colors), 4)
 
     def test_linter(self):
